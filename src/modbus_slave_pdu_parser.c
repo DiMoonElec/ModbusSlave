@@ -1,14 +1,24 @@
 #include "ModbusSlave/public-api.h"
 #include "inc/modbus_slave_pdu_parser.h"
 #include "modbus_slave_config.h"
+#include <string.h>
 
 #define EXCEPT_ILLEGAL_FUNCTION 0x01
 #define EXCEPT_ILLEGAL_DATA_ADDRESS 0x02
 #define EXCEPT_ILLEGAL_DATA_VALUE 0x03
+#define EXCEPT_SLAVE_DEVICE_FAILURE 0x04
 
 #define FC_READ_HOLDING_REGISTER 0x03
 #define FC_WRITE_SINGLE_REGISTER 0x06
 #define FC_WRITE_MULTIPLE_REGISTERS 0x10
+
+enum
+{
+  MODBUS_STATE_BEGIN = 0,
+  MODBUS_STATE_PROCESSED,
+  MODBUS_STATE_REQUEST_ERROR,
+  MODBUS_STATE_INTERNAL_ERROR
+};
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -103,7 +113,69 @@ static uint16_t read_holding_registers(uint8_t *pdu_req,
 
 #else
 
-#error The advanced register model has not yet been implemented.
+  modbus_slave_context_t context;
+  uint16_t reg_counter = start_reg;
+  context.buffer = out;
+  context.tail = reg_count;
+
+  while (context.tail > 0)
+  {
+    context.state = MODBUS_STATE_BEGIN;
+
+    uint16_t consumed;
+
+    if (read_holding_reg_callback)
+      read_holding_reg_callback(reg_counter, &context);
+
+    switch (context.state)
+    {
+    case MODBUS_STATE_BEGIN:
+      /*Данный регистр не обработан Callback-функцией,
+        присваиваем значение по-умолчанию 0x0000
+        и пропускаем его */
+      context.buffer[0] = 0;
+      context.buffer[1] = 0;
+      consumed = 1; // 1 регистр записан
+      break;
+    ////////////////////////////////////////
+    case MODBUS_STATE_PROCESSED:
+      /* Данный регистр был обработан Callback-функцией,
+         смотрим, сколько регистров было записано */
+      consumed = context.consumed;
+      break;
+    ////////////////////////////////////////
+    case MODBUS_STATE_REQUEST_ERROR:
+      /* Master запросил недостаточное число регистров,
+      выходим с ошибкой */
+      if (is_broadcast)
+        return 0;
+
+      return make_exception_response(
+          pdu_resp,
+          pdu_resp_size,
+          FC_WRITE_MULTIPLE_REGISTERS,
+          EXCEPT_ILLEGAL_DATA_VALUE);
+      break;    
+    ////////////////////////////////////////
+    default:
+      if (is_broadcast)
+        return 0;
+
+      return make_exception_response(
+          pdu_resp,
+          pdu_resp_size,
+          FC_WRITE_MULTIPLE_REGISTERS,
+          EXCEPT_SLAVE_DEVICE_FAILURE);
+      break;
+    }
+
+    // Сдвигаем указатели и счетчики
+    // на количество поглощенных регистров
+    context.buffer += (consumed * 2); // 1 регистр занимает 2 байта
+    context.tail -= consumed;
+    reg_counter += consumed;
+  }
+
 
 #endif
 
@@ -129,16 +201,55 @@ static uint16_t write_single_register(uint8_t *pdu_req,
   }
 
   uint16_t reg_addr = ((uint16_t)pdu_req[1] << 8) | pdu_req[2];
-  uint16_t reg_value = ((uint16_t)pdu_req[3] << 8) | pdu_req[4];
 
 #if defined(MODBUS_SLAVE_CFG_REGMODEL_SIMPLE)
+  
+  uint16_t reg_value = ((uint16_t)pdu_req[3] << 8) | pdu_req[4];
 
   if (write_holding_reg_callback != 0)
     write_holding_reg_callback(reg_addr, reg_value);
 
 #else
 
-#error The advanced register model has not yet been implemented.
+  modbus_slave_context_t context;
+  context.buffer = pdu_req + 3;
+  context.tail = 1;
+
+  context.state = MODBUS_STATE_BEGIN;
+
+  if (write_holding_reg_callback)
+      write_holding_reg_callback(reg_addr, &context);
+
+  switch (context.state)
+  {
+  case MODBUS_STATE_BEGIN:
+  case MODBUS_STATE_PROCESSED:
+    break;
+  ////////////////////////////////////////
+  case MODBUS_STATE_REQUEST_ERROR:
+    /* Master предоставил недостаточное число регистров,
+    выходим с ошибкой */
+    if (is_broadcast)
+      return 0;
+
+    return make_exception_response(
+        pdu_resp,
+        pdu_resp_size,
+        FC_WRITE_MULTIPLE_REGISTERS,
+        EXCEPT_ILLEGAL_DATA_VALUE);
+    break;    
+  ////////////////////////////////////////
+  default:
+    if (is_broadcast)
+      return 0;
+
+    return make_exception_response(
+        pdu_resp,
+        pdu_resp_size,
+        FC_WRITE_MULTIPLE_REGISTERS,
+        EXCEPT_SLAVE_DEVICE_FAILURE);
+    break;
+  }
 
 #endif
 
@@ -242,11 +353,11 @@ static uint16_t write_multiple_registers(uint8_t *pdu_req,
         EXCEPT_ILLEGAL_DATA_VALUE);
   }
 
-  uint8_t *in = pdu_req + 6;
-
   // Write each register
 
 #if defined(MODBUS_SLAVE_CFG_REGMODEL_SIMPLE)
+  
+  uint8_t *in = pdu_req + 6;
 
   for (uint16_t i = 0; i < reg_count; i++)
   {
@@ -260,7 +371,65 @@ static uint16_t write_multiple_registers(uint8_t *pdu_req,
 
 #else
 
-#error The advanced register model has not yet been implemented.
+  modbus_slave_context_t context;
+  uint16_t reg_counter = start_reg;
+  context.buffer = pdu_req + 6;
+  context.tail = reg_count;
+
+  while (context.tail > 0)
+  {
+    context.state = MODBUS_STATE_BEGIN;
+
+    uint16_t consumed;
+
+    if (write_holding_reg_callback)
+      write_holding_reg_callback(reg_counter, &context);
+
+    switch (context.state)
+    {
+    case MODBUS_STATE_BEGIN:
+      /* Данный регистр не обработан Callback-функцией,
+         значит просто пропускаем его */
+      consumed = 1;
+      break;
+    ////////////////////////////////////////
+    case MODBUS_STATE_PROCESSED:
+      /* Данный регистр был обработан Callback-функцией,
+         смотрим, сколько регистров было прочитано */
+      consumed = context.consumed;
+      break;
+    ////////////////////////////////////////
+    case MODBUS_STATE_REQUEST_ERROR:
+      /* Master предоставил недостаточное число регистров,
+      выходим с ошибкой */
+      if (is_broadcast)
+        return 0;
+
+      return make_exception_response(
+          pdu_resp,
+          pdu_resp_size,
+          FC_WRITE_MULTIPLE_REGISTERS,
+          EXCEPT_ILLEGAL_DATA_VALUE);
+      break;    
+    ////////////////////////////////////////
+    default:
+      if (is_broadcast)
+        return 0;
+
+      return make_exception_response(
+          pdu_resp,
+          pdu_resp_size,
+          FC_WRITE_MULTIPLE_REGISTERS,
+          EXCEPT_SLAVE_DEVICE_FAILURE);
+      break;
+    }
+
+    // Сдвигаем указатели и счетчики
+    // на количество поглощенных регистров
+    context.buffer += (consumed * 2); // 1 регистр занимает 2 байта
+    context.tail -= consumed;
+    reg_counter += consumed;
+  }
 
 #endif
 
@@ -327,8 +496,6 @@ uint16_t modbus_slave_pdu_parse(uint8_t *request,
 
 ////////////////////////////////////////////////////////////////////////////////
 
-#if defined(MODBUS_SLAVE_CFG_REGMODEL_SIMPLE)
-
 void modbus_slave_set_write_holding_reg_callback(modbus_slave_write_holding_reg_callback_t cb)
 {
   write_holding_reg_callback = cb;
@@ -339,8 +506,117 @@ void modbus_slave_set_read_holding_reg_callback(modbus_slave_read_holding_reg_ca
   read_holding_reg_callback = cb;
 }
 
-#else
+#if !defined(MODBUS_SLAVE_CFG_REGMODEL_SIMPLE)
 
-#error The advanced register model has not yet been implemented.
+
+bool modbus_slave_write_holding_reg32(modbus_slave_context_t *context, void *value)
+{
+  if(context->state != MODBUS_STATE_BEGIN)
+  {
+    // Ошибка использования API
+    context->state = MODBUS_STATE_INTERNAL_ERROR;
+    return false;
+  }
+
+  if (context->tail < 2)
+  {
+    // Не можем поглотить такое количество регистров,
+    // Количество переданных мастером регистров недостаточно
+    context->state = MODBUS_STATE_REQUEST_ERROR;
+    return false;
+  }
+
+  // Пример, порядок слов по соглашению
+  uint32_t tmp;
+  uint8_t *in = context->buffer;
+  
+  tmp = (uint32_t)(*in++) << 24;
+  tmp |= (uint32_t)(*in++) << 16;
+  tmp |= (uint32_t)(*in++) << 8;
+  tmp |= (uint32_t)(*in);
+  
+  memcpy(value, &tmp, sizeof(tmp));
+  
+  context->consumed = 2; // Съели 2 регистра
+  context->state = MODBUS_STATE_PROCESSED; // Обработка прошла успешно
+  return true;
+}
+
+bool modbus_slave_write_holding_reg16(modbus_slave_context_t *context, void *value)
+{
+  if(context->state != MODBUS_STATE_BEGIN)
+  {
+    // Ошибка использования API
+    context->state = MODBUS_STATE_INTERNAL_ERROR;
+    return false;
+  }
+
+  // Вышестоящий код гарантирует, что для чтения доступен хотя бы один регистр
+
+  uint16_t tmp;
+  uint8_t *in = context->buffer;
+  
+  tmp = (uint16_t)(*in++) << 8;
+  tmp |= (uint16_t)(*in);
+  
+  memcpy(value, &tmp, sizeof(tmp));
+  
+  context->consumed = 1; // Съели 1 регистр
+  context->state = MODBUS_STATE_PROCESSED; // Обработка прошла успешно
+  return true;
+}
+
+void modbus_slave_read_holding_reg32(modbus_slave_context_t *context, void *value)
+{
+  if(context->state != MODBUS_STATE_BEGIN)
+  {
+    // Ошибка использования API
+    context->state = MODBUS_STATE_INTERNAL_ERROR;
+    return;
+  }
+
+  if (context->tail < 2)
+  {
+    // Не можем отправить такое количество регистров,
+    // Количество запрошенных мастером регистров недостаточно
+    // для данного регистрового поля
+    context->state = MODBUS_STATE_REQUEST_ERROR;
+    return;
+  }
+
+  uint32_t tmp;
+  uint8_t *out = context->buffer;
+
+  memcpy(&tmp, value, sizeof(tmp));
+
+  (*out++) = (uint8_t)(tmp >> 24);
+  (*out++) = (uint8_t)(tmp >> 16);
+  (*out++) = (uint8_t)(tmp >> 8);
+  (*out) =  (uint8_t)(tmp);
+
+  context->consumed = 2; // Съели 2 регистра
+  context->state = MODBUS_STATE_PROCESSED; // Обработка прошла успешно
+}
+
+void modbus_slave_read_holding_reg16(modbus_slave_context_t *context, void *value)
+{
+  if(context->state != MODBUS_STATE_BEGIN)
+  {
+    // Ошибка использования API
+    context->state = MODBUS_STATE_INTERNAL_ERROR;
+    return;
+  }
+
+  uint16_t tmp;
+  uint8_t *out = context->buffer;
+
+  memcpy(&tmp, value, sizeof(tmp));
+
+  (*out++) = (uint8_t)(tmp >> 8);
+  (*out) =  (uint8_t)(tmp);
+
+  context->consumed = 1; // Съели 1 регистр
+  context->state = MODBUS_STATE_PROCESSED; // Обработка прошла успешно
+}
 
 #endif
