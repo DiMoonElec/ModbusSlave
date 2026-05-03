@@ -28,9 +28,11 @@ typedef void (*modbus_slave_read_holding_reg_callback_t)(uint16_t reg,
 
 bool modbus_slave_write_holding_reg32(modbus_slave_context_t *context, void *value);
 bool modbus_slave_write_holding_reg16(modbus_slave_context_t *context, void *value);
+bool modbus_slave_write_holding_reg8(modbus_slave_context_t *context, void *value);
 
 void modbus_slave_read_holding_reg32(modbus_slave_context_t *context, void *value);
 void modbus_slave_read_holding_reg16(modbus_slave_context_t *context, void *value);
+void modbus_slave_read_holding_reg8(modbus_slave_context_t *context, void *value);
 
 #endif
 

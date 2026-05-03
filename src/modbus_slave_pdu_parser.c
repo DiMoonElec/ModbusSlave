@@ -566,6 +566,30 @@ bool modbus_slave_write_holding_reg16(modbus_slave_context_t *context, void *val
   return true;
 }
 
+bool modbus_slave_write_holding_reg8(modbus_slave_context_t *context, void *value)
+{
+  if(context->state != MODBUS_STATE_BEGIN)
+  {
+    // Ошибка использования API
+    context->state = MODBUS_STATE_INTERNAL_ERROR;
+    return false;
+  }
+
+  // Вышестоящий код гарантирует, что доступен хотя бы один регистр
+
+  uint8_t tmp;
+  uint8_t *in = context->buffer;
+  
+  (void)(*in++);   // пропускаем старший байт
+  tmp = (*in);     // берём младший байт
+  
+  memcpy(value, &tmp, sizeof(tmp));
+  
+  context->consumed = 1; // Съели 1 регистр
+  context->state = MODBUS_STATE_PROCESSED; // Обработка прошла успешно
+  return true;
+}
+
 void modbus_slave_read_holding_reg32(modbus_slave_context_t *context, void *value)
 {
   if(context->state != MODBUS_STATE_BEGIN)
@@ -614,6 +638,27 @@ void modbus_slave_read_holding_reg16(modbus_slave_context_t *context, void *valu
 
   (*out++) = (uint8_t)(tmp >> 8);
   (*out) =  (uint8_t)(tmp);
+
+  context->consumed = 1; // Съели 1 регистр
+  context->state = MODBUS_STATE_PROCESSED; // Обработка прошла успешно
+}
+
+void modbus_slave_read_holding_reg8(modbus_slave_context_t *context, void *value)
+{
+  if(context->state != MODBUS_STATE_BEGIN)
+  {
+    // Ошибка использования API
+    context->state = MODBUS_STATE_INTERNAL_ERROR;
+    return;
+  }
+
+  uint8_t tmp;
+  uint8_t *out = context->buffer;
+
+  memcpy(&tmp, value, sizeof(tmp));
+
+  (*out++) = 0x00;      // старший байт регистра
+  (*out)   = tmp;       // младший байт регистра
 
   context->consumed = 1; // Съели 1 регистр
   context->state = MODBUS_STATE_PROCESSED; // Обработка прошла успешно
