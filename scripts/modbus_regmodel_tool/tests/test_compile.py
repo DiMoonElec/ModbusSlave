@@ -1,7 +1,7 @@
 """
 Сквозная проверка: генерируем .c/.h для тестовой YAML-карты, кладём рядом
 заглушки библиотеки Modbus-слейва и пользовательских getter/setter,
-и просим gcc проверить синтаксис и типы (-fsyntax-only).
+и просим GCC или MSVC проверить синтаксис и типы.
 
 Это самый сильный доступный тест на корректность генератора: балансировка
 скобок или ручной просмотр вывода не поймают, например, несовпадение
@@ -17,6 +17,22 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modbus_regmodel.cli import run
+
+
+COMPILER = shutil.which('gcc') or shutil.which('cl')
+
+
+def compile_c(tmp, sources, include_dirs, *, syntax_only):
+    if os.path.basename(COMPILER).lower() in ('cl', 'cl.exe'):
+        args = [COMPILER, '/nologo', '/std:c11', '/utf-8']
+        args += ['/W4', '/WX', '/Zs'] if syntax_only else ['/W3', '/Fe:regmodel_test.exe']
+        args += ['/I' + path for path in include_dirs]
+    else:
+        args = [COMPILER, '-std=c11', '-Wall', '-Wextra']
+        args += ['-Werror', '-fsyntax-only'] if syntax_only else ['-o', 'regmodel_test.exe']
+        for path in include_dirs:
+            args += ['-I', path]
+    return subprocess.run(args + sources, cwd=tmp, capture_output=True, text=True, errors='replace')
 
 TEST_YAML = """\
 registers:
@@ -65,20 +81,17 @@ blocks:
     repeat: 3
     step: 0x10
     registers:
-      - offset: 0x00
-        name: TEMP_CURRENT
+      - name: TEMP_CURRENT
         type: float
         getter: ch_get_temp
 
-      - offset: 0x02
-        name: SETPOINT_HISTORY
+      - name: SETPOINT_HISTORY
         type: float
         count: 2
         getter: ch_get_setpoint_history
         setter: ch_set_setpoint_history
 
-      - offset: 0x06
-        name: ENABLED
+      - name: ENABLED
         type: bool
         getter: ch_get_enabled
         setter: ch_set_enabled
@@ -147,9 +160,9 @@ void ch_set_enabled(uint16_t instance, bool value);
 """
 
 
-@unittest.skipIf(shutil.which("gcc") is None, "gcc недоступен в этом окружении")
+@unittest.skipIf(COMPILER is None, "GCC или MSVC недоступен в этом окружении")
 class TestGeneratedCCompiles(unittest.TestCase):
-    def test_generated_c_passes_gcc_syntax_check(self):
+    def test_generated_c_passes_syntax_check(self):
         with tempfile.TemporaryDirectory() as tmp:
             yaml_path = os.path.join(tmp, "reg.yaml")
             with open(yaml_path, "w", encoding="utf-8") as f:
@@ -184,14 +197,10 @@ class TestGeneratedCCompiles(unittest.TestCase):
             with open(c_path, "w", encoding="utf-8") as f:
                 f.write(src)
 
-            proc = subprocess.run(
-                ["gcc", "-std=c11", "-Wall", "-Wextra", "-Werror",
-                 "-fsyntax-only", "-I", tmp, c_path],
-                cwd=tmp, capture_output=True, text=True,
-            )
+            proc = compile_c(tmp, [c_path], [tmp], syntax_only=True)
             self.assertEqual(
                 proc.returncode, 0,
-                msg=f"gcc не прошёл проверку синтаксиса/типов:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+                msg=f"Компилятор не прошёл проверку синтаксиса/типов:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
             )
 
 

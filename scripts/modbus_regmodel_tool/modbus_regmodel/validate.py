@@ -6,17 +6,17 @@ C-имён и отсутствие пересечений адресов меж�
 """
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Iterable
 
-from .model import FlatRegister
+from .model import FlatRegister, LogicalBlock
 
 
-def validate_model(registers: Iterable[FlatRegister]) -> list[str]:
+def validate_model(registers: Iterable[FlatRegister], blocks: Iterable[LogicalBlock]) -> list[str]:
     """Возвращает список всех найденных ошибок, не останавливаясь на первой."""
     registers = list(registers)
     errors: list[str] = []
     errors.extend(_check_unique_names(registers))
-    errors.extend(_check_overlaps(registers))
+    errors.extend(_check_overlaps(registers, blocks))
     return errors
 
 
@@ -34,34 +34,31 @@ def _check_unique_names(registers: list[FlatRegister]) -> list[str]:
     return errors
 
 
-def _check_overlaps(registers: list[FlatRegister]) -> list[str]:
+def _check_overlaps(registers: list[FlatRegister], blocks: Iterable[LogicalBlock]) -> list[str]:
     """
     Проверка пересечений диапазонов адресов.
 
-    Реализована как sweep по левой границе с отслеживанием максимального
-    встреченного правого края, а не сравнением только соседних пар после
-    сортировки по адресу. Сравнение только соседних пар корректно лишь пока
-    ни одна запись не занимает больше 2 регистров (иначе один широкий
-    интервал может "перепрыгнуть" через дыру и пропустить пересечение с
-    записью через один шаг). Sweep с максимумом корректен всегда, независимо
-    от ширины записей - это важно, если формат когда-нибудь получит более
-    широкие типы (например, 64-битные).
+    Каждый блок занимает всю область до end_addr, включая хвост последнего
+    экземпляра или колонки. Его поля уже размещены парсером, поэтому
+    проверяются области блоков и регистры верхнего уровня. Максимум правого
+    края позволяет обнаружить и вложенные пересечения.
     """
     errors: list[str] = []
-    ordered = sorted(registers, key=lambda r: (r.addr, r.end_addr))
+    regions = [(r.addr, r.end_addr, r.id) for r in registers if not r.is_in_block]
+    regions.extend((b.start_addr, b.end_addr, f"block '{b.name}'") for b in blocks)
 
     max_end = -1
-    max_end_owner: Optional[FlatRegister] = None
+    max_owner = None
 
-    for reg in ordered:
-        if max_end_owner is not None and reg.addr <= max_end:
+    for start, end, owner in sorted(regions):
+        if max_owner is not None and start <= max_end:
             errors.append(
-                f"Пересечение адресов: '{max_end_owner.id}' "
-                f"(0x{max_end_owner.addr:04X}..0x{max_end_owner.end_addr:04X}) "
-                f"и '{reg.id}' (0x{reg.addr:04X}..0x{reg.end_addr:04X})"
+                f"Пересечение адресов: '{max_owner[2]}' "
+                f"(0x{max_owner[0]:04X}..0x{max_end:04X}) "
+                f"и '{owner}' (0x{start:04X}..0x{end:04X})"
             )
-        if reg.end_addr > max_end:
-            max_end = reg.end_addr
-            max_end_owner = reg
+        if end > max_end:
+            max_end = end
+            max_owner = (start, end, owner)
 
     return errors

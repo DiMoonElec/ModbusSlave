@@ -49,14 +49,12 @@ blocks:
     repeat: 12
     step: 0x10
     registers:
-      - offset: 0x00
-        name: TEMP_CURRENT
+      - name: TEMP_CURRENT
         type: float
         getter: ch_get_temp
         unit: "°C"
         description: "Текущая температура канала"
-      - offset: 0x02
-        name: SETPOINT_HISTORY
+      - name: SETPOINT_HISTORY
         type: float
         count: 2
         getter: ch_get_setpoint_history
@@ -71,7 +69,7 @@ def build(tmp: str, text: str):
         f.write(textwrap.dedent(text))
     result = parse_spec(path)
     assert result.errors == [], result.errors
-    assert validate_model(result.registers) == []
+    assert validate_model(result.registers, result.blocks) == []
     return result
 
 
@@ -113,6 +111,31 @@ class TestDocgen(unittest.TestCase):
             section2 = md.split("## 3.")[0]
             self.assertIn("RESERVED_EXPANSION", section2)
             self.assertIn("RESERVED", section2)
+
+    def test_computed_offsets_include_reserved_gap(self):
+        text = """
+        blocks:
+          - name: CH
+            start_addr: 256
+            repeat: 2
+            registers:
+              - name: TEMP
+                type: float
+                getter: get_temp
+              - name: RESERVED_1
+                type: uint16
+                count: 3
+              - name: VALUE
+                type: uint16
+                getter: get_value
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            md = generate_markdown(build(tmp, text))
+            self.assertIn('Шаг между экземплярами: 6', md)
+            self.assertIn('| RESERVED_1 | 2 .. 4 (0x02 .. 0x04) | uint16_t | RESERVED | 3 |', md)
+            self.assertIn('| VALUE | 5 (0x05) |', md)
+            self.assertIn('| 267 | 0x010B | CH_1_VALUE |', md)
+            self.assertIn('для них `#define` и обработчики не генерируются', md)
 
     def test_block_shown_once_not_per_instance(self):
         with tempfile.TemporaryDirectory() as tmp:

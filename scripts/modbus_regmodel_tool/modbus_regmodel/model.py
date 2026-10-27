@@ -68,7 +68,7 @@ def compute_access_mode(getter: Optional[str], setter: Optional[str]) -> str:
 
 @dataclass
 class _CommonFields:
-    raw_addr: int                 # 'addr' для top-level или 'offset' внутри блока
+    raw_addr: int                 # 'addr' или вычисленное смещение внутри блока
     canonical_type: str
     regs_per_element: int
     count: Optional[int]
@@ -140,8 +140,18 @@ class LogicalBlock:
     name: str
     start_addr: int
     repeat: int
-    step: int
+    step: Optional[int] = None
     registers: list[LogicalBlockRegister] = field(default_factory=list)
+    is_planar: bool = False
+    capacity: Optional[int] = None
+
+    @property
+    def end_addr(self) -> int:
+        if self.is_planar:
+            size = self.capacity * sum(r.regs_per_element for r in self.registers)
+        else:
+            size = self.repeat * self.step
+        return self.start_addr + size - 1
 
 
 # --- Плоская (полностью развёрнутая) модель ---------------------------------
@@ -163,6 +173,7 @@ class FlatRegister:
     reg_name: Optional[str] = None
     instance_index: Optional[int] = None
     elem_index: Optional[int] = None
+    is_planar: bool = False
 
     @property
     def occupied(self) -> int:
@@ -207,7 +218,10 @@ class FlatRegister:
         if self.reg_name is None:
             return None
         if self.is_in_block:
-            base = f"{self.block_name}_{self.instance_index}_{self.reg_name}"
+            if self.is_planar:
+                base = f"{self.block_name}_{self.reg_name}_{self.instance_index}"
+            else:
+                base = f"{self.block_name}_{self.instance_index}_{self.reg_name}"
         else:
             base = f"REG_{self.reg_name}"
         if self.is_array_element:
@@ -219,7 +233,7 @@ class FlatRegister:
 class ParseResult:
     registers: list[FlatRegister]
     top_registers: list[LogicalTopRegister]
-    blocks: list[LogicalBlock]
+    blocks: list[LogicalBlock]     # Оба вида блоков; раскладка отмечена is_planar.
     includes: list[str]
     output: OutputSpec
     errors: list[str]
@@ -258,12 +272,15 @@ def parse_spec(yaml_path: str) -> ParseResult:
 
     has_registers = isinstance(data.get('registers'), list)
     has_blocks = isinstance(data.get('blocks'), list)
+    has_planar_blocks = isinstance(data.get('planar_blocks'), list)
+    if 'planar_blocks' in data and not has_planar_blocks:
+        errors.append("Поле 'planar_blocks' должно быть списком")
 
-    if not has_registers and not has_blocks:
-        errors.append("Файл должен содержать хотя бы один из разделов: 'registers' или 'blocks'")
+    if not has_registers and not has_blocks and not has_planar_blocks:
+        errors.append("Файл должен содержать хотя бы один из разделов: 'registers', 'blocks' или 'planar_blocks'")
 
     def validate_common(
-        reg_data: Any, ctx: str, addr_field: str, block_step: Optional[int],
+        reg_data: Any, ctx: str, computed_offset: Optional[int] = None,
     ) -> Optional[_CommonFields]:
         """Валидирует поля, общие для top-level регистра и регистра внутри
         блока. Выполняется РОВНО ОДИН РАЗ на каждое определение регистра в
@@ -273,16 +290,20 @@ def parse_spec(yaml_path: str) -> ParseResult:
             errors.append(f"[{ctx}] Элемент должен быть словарём")
             return None
 
-        if addr_field not in reg_data:
-            errors.append(f"[{ctx}] Отсутствует обязательное поле '{addr_field}'")
+        if 'offset' in reg_data:
+            errors.append(f"[{ctx}] offset удалён из формата, используйте регистр без getter/setter (например, RESERVED)")
             return None
 
-        raw_addr = reg_data[addr_field]
+        if computed_offset is None and 'addr' not in reg_data:
+            errors.append(f"[{ctx}] Отсутствует обязательное поле 'addr'")
+            return None
+
+        raw_addr = reg_data['addr'] if computed_offset is None else computed_offset
         if not _is_plain_int(raw_addr):
-            errors.append(f"[{ctx}] Поле '{addr_field}' должно быть целым числом")
+            errors.append(f"[{ctx}] Поле 'addr' должно быть целым числом")
             return None
         if raw_addr < 0:
-            errors.append(f"[{ctx}] Поле '{addr_field}' не может быть отрицательным")
+            errors.append(f"[{ctx}] Поле 'addr' не может быть отрицательным")
             return None
 
         if 'type' not in reg_data:
@@ -311,16 +332,6 @@ def parse_spec(yaml_path: str) -> ParseResult:
                 )
                 reg_name = None
 
-        # offset + occupied <= step - только для регистров внутри блока.
-        if block_step is not None:
-            total_occupied = (count or 1) * regs_per_element
-            if raw_addr + total_occupied > block_step:
-                errors.append(
-                    f"[{ctx}] Регистр выходит за границу шага блока: "
-                    f"offset (0x{raw_addr:02X}) + occupied ({total_occupied}) "
-                    f"> step (0x{block_step:02X})"
-                )
-
         getter = reg_data.get('getter')
         setter = reg_data.get('setter')
         if getter is not None and not isinstance(getter, str):
@@ -342,6 +353,7 @@ def parse_spec(yaml_path: str) -> ParseResult:
     def expand_flat(
         common: _CommonFields, ctx: str, base_addr: int,
         block_name: Optional[str], instance_index: Optional[int],
+        is_planar: bool = False,
     ) -> None:
         """Разворачивает одно провалидированное определение регистра в одну
         или несколько записей FlatRegister (по числу count, если задан)."""
@@ -364,6 +376,7 @@ def parse_spec(yaml_path: str) -> ParseResult:
                 description=common.description, unit=common.unit,
                 block_name=block_name, reg_name=common.reg_name,
                 instance_index=instance_index, elem_index=elem_idx,
+                is_planar=is_planar,
             ))
 
         if common.count is not None:
@@ -376,7 +389,7 @@ def parse_spec(yaml_path: str) -> ParseResult:
     if has_registers:
         for i, reg in enumerate(data['registers']):
             ctx = f"registers[{i}]"
-            common = validate_common(reg, ctx, addr_field='addr', block_step=None)
+            common = validate_common(reg, ctx)
             if common is None:
                 continue
             expand_flat(common, ctx, base_addr=0, block_name=None, instance_index=None)
@@ -387,61 +400,64 @@ def parse_spec(yaml_path: str) -> ParseResult:
                 description=common.description, unit=common.unit,
             ))
 
-    if has_blocks:
-        for b_idx, block in enumerate(data['blocks']):
+    seen_block_names: set[str] = set()
+    for section in ('blocks', 'planar_blocks'):
+        is_planar = section == 'planar_blocks'
+        if not isinstance(data.get(section), list):
+            continue
+        for b_idx, block in enumerate(data[section]):
             if not isinstance(block, dict):
-                errors.append(f"[blocks[{b_idx}]] Элемент должен быть словарём")
+                errors.append(f"[{section}[{b_idx}]] Элемент должен быть словарём")
                 continue
 
-            required = ('name', 'start_addr', 'repeat', 'step', 'registers')
+            required = ('name', 'start_addr', 'repeat', 'registers')
             missing = [k for k in required if k not in block]
             for k in missing:
-                errors.append(f"[blocks[{b_idx}]] Отсутствует обязательное поле '{k}'")
+                errors.append(f"[{section}[{b_idx}]] Отсутствует обязательное поле '{k}'")
             if missing:
                 continue
 
             block_name = block['name']
             if not isinstance(block_name, str) or not is_valid_name(block_name):
                 errors.append(
-                    f"[blocks[{b_idx}]] Имя блока '{block_name}' недопустимо. "
+                    f"[{section}[{b_idx}]] Имя блока '{block_name}' недопустимо. "
                     f"Разрешены только [A-Z0-9_]+, не начиная с цифры"
                 )
                 continue
 
-            start_addr, repeat, step = block['start_addr'], block['repeat'], block['step']
-            if not all(_is_plain_int(v) for v in (start_addr, repeat, step)):
-                errors.append(f"[blocks[{b_idx}]('{block_name}')] start_addr, repeat и step должны быть целыми числами")
+            if block_name in seen_block_names:
+                errors.append(f"[{section}[{b_idx}]] Дублирование имени блока '{block_name}' среди blocks и planar_blocks")
+                continue
+            seen_block_names.add(block_name)
+
+            start_addr, repeat = block['start_addr'], block['repeat']
+            if not all(_is_plain_int(v) for v in (start_addr, repeat)):
+                errors.append(f"[{section}[{b_idx}]('{block_name}')] start_addr и repeat должны быть целыми числами")
                 continue
             if repeat < 1:
-                errors.append(f"[blocks[{b_idx}]('{block_name}')] repeat должен быть >= 1")
-                continue
-            if step <= 0:
-                errors.append(f"[blocks[{b_idx}]('{block_name}')] step должен быть положительным")
+                errors.append(f"[{section}[{b_idx}]('{block_name}')] repeat должен быть >= 1")
                 continue
             if start_addr < 0:
-                errors.append(f"[blocks[{b_idx}]('{block_name}')] start_addr не может быть отрицательным")
+                errors.append(f"[{section}[{b_idx}]('{block_name}')] start_addr не может быть отрицательным")
                 continue
 
             block_regs = block['registers']
             if not isinstance(block_regs, list) or not block_regs:
-                errors.append(f"[blocks[{b_idx}]('{block_name}')] 'registers' должен быть непустым списком")
-                continue
-
-            last_instance_start = start_addr + (repeat - 1) * step
-            if last_instance_start > MODBUS_ADDR_MAX:
-                errors.append(
-                    f"[blocks[{b_idx}]('{block_name}')] Последний экземпляр блока начинается "
-                    f"с 0x{last_instance_start:04X} - уже выходит за пределы 0xFFFF"
-                )
+                errors.append(f"[{section}[{b_idx}]('{block_name}')] 'registers' должен быть непустым списком")
                 continue
 
             # Валидируем каждое определение регистра внутри блока РОВНО ОДИН
             # РАЗ (а не по разу на каждый из repeat экземпляров).
             validated: list[Optional[_CommonFields]] = []
             block_logical_regs: list[LogicalBlockRegister] = []
+            occupied = 0
             for r_idx, reg in enumerate(block_regs):
-                ctx0 = f"blocks[{b_idx}]('{block_name}').reg[{r_idx}]"
-                common = validate_common(reg, ctx0, addr_field='offset', block_step=step)
+                ctx0 = f"{section}[{b_idx}]('{block_name}').reg[{r_idx}]"
+                if is_planar and isinstance(reg, dict) and 'count' in reg:
+                    errors.append(f"[{ctx0}] count запрещён в planar_blocks, в том числе для резервов")
+                    validated.append(None)
+                    continue
+                common = validate_common(reg, ctx0, computed_offset=occupied)
                 validated.append(common)
                 if common is not None:
                     block_logical_regs.append(LogicalBlockRegister(
@@ -450,19 +466,63 @@ def parse_spec(yaml_path: str) -> ParseResult:
                         getter=common.getter, setter=common.setter,
                         description=common.description, unit=common.unit,
                     ))
+                    occupied += (common.count or 1) * common.regs_per_element
 
-            logical_blocks.append(LogicalBlock(
+            if any(common is None for common in validated):
+                continue
+
+            step = None
+            capacity = None
+            if is_planar:
+                if 'step' in block:
+                    errors.append(f"[{section}[{b_idx}]('{block_name}')] step запрещён в planar_blocks; используйте capacity")
+                    continue
+                capacity = block.get('capacity', repeat)
+                if not _is_plain_int(capacity) or capacity <= 0:
+                    errors.append(f"[{section}[{b_idx}]('{block_name}')] capacity должен быть положительным целым числом")
+                    continue
+                if capacity < repeat:
+                    errors.append(f"[{section}[{b_idx}]('{block_name}')] capacity ({capacity}) меньше repeat ({repeat})")
+                    continue
+                for k, common in enumerate(validated):
+                    common.raw_addr *= capacity
+                    block_logical_regs[k].offset = common.raw_addr
+            else:
+                if 'capacity' in block:
+                    errors.append(f"[{section}[{b_idx}]('{block_name}')] capacity запрещён в blocks; используйте step")
+                    continue
+                step = block.get('step', occupied)
+                if not _is_plain_int(step) or step <= 0:
+                    errors.append(f"[{section}[{b_idx}]('{block_name}')] step должен быть положительным целым числом")
+                    continue
+                if step < occupied:
+                    errors.append(
+                        f"[{section}[{b_idx}]('{block_name}')] Размер ({occupied}) "
+                        f"выходит за границу шага блока: step ({step}) меньше требуемого ({occupied})"
+                    )
+                    continue
+
+            logical_block = LogicalBlock(
                 name=block_name, start_addr=start_addr, repeat=repeat, step=step,
-                registers=block_logical_regs,
-            ))
+                registers=block_logical_regs, is_planar=is_planar, capacity=capacity,
+            )
+            end_addr = logical_block.end_addr
+            if end_addr > MODBUS_ADDR_MAX:
+                errors.append(
+                    f"[{section}[{b_idx}]('{block_name}')] Конечный адрес области блока "
+                    f"с учётом хвоста 0x{end_addr:04X} выходит за пределы 0xFFFF"
+                )
+                continue
+
+            logical_blocks.append(logical_block)
 
             for inst in range(repeat):
-                base_addr = start_addr + inst * step
                 for r_idx, common in enumerate(validated):
                     if common is None:
                         continue
-                    ctx = f"blocks[{b_idx}]('{block_name}').inst[{inst}].reg[{r_idx}]"
-                    expand_flat(common, ctx, base_addr, block_name=block_name, instance_index=inst)
+                    base_addr = start_addr + inst * (common.regs_per_element if is_planar else step)
+                    ctx = f"{section}[{b_idx}]('{block_name}').inst[{inst}].reg[{r_idx}]"
+                    expand_flat(common, ctx, base_addr, block_name=block_name, instance_index=inst, is_planar=is_planar)
 
     includes = data.get('includes') or []
     if not isinstance(includes, list) or not all(isinstance(x, str) for x in includes):

@@ -19,7 +19,7 @@ def run(yaml_path: str, *, dry_run: bool = False) -> int:
     # Перекрёстную валидацию имеет смысл запускать, только если структурный
     # разбор прошёл чисто - иначе плоская модель может быть неполной/некорректной.
     if not errors:
-        errors.extend(validate_model(result.registers))
+        errors.extend(validate_model(result.registers, result.blocks))
 
     if errors:
         print(f"НАЙДЕНЫ ОШИБКИ ({len(errors)}):", file=sys.stderr)

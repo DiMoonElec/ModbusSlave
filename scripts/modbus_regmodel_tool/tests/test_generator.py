@@ -4,6 +4,8 @@ import tempfile
 import textwrap
 import unittest
 
+import yaml
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modbus_regmodel.model import parse_spec
@@ -58,13 +60,11 @@ blocks:
     repeat: 3
     step: 0x10
     registers:
-      - offset: 0x00
-        name: TEMP_CURRENT
+      - name: TEMP_CURRENT
         type: float
         getter: ch_get_temp
 
-      - offset: 0x02
-        name: SETPOINT_HISTORY
+      - name: SETPOINT_HISTORY
         type: float
         count: 2
         getter: ch_get_setpoint_history
@@ -83,7 +83,7 @@ class TestParsing(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result = parse_ok(tmp, "reg.yaml", BASIC_YAML)
             self.assertEqual(result.errors, [])
-            self.assertEqual(validate_model(result.registers), [])
+            self.assertEqual(validate_model(result.registers, result.blocks), [])
 
     def test_basic_flat_count(self):
         # top-level: 1 + 1 + 3 + 1 + 2 = 8
@@ -124,7 +124,7 @@ class TestParsing(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result = parse_ok(tmp, "reg.yaml", text)
             self.assertEqual(result.errors, [])
-            errors = validate_model(result.registers)
+            errors = validate_model(result.registers, result.blocks)
             self.assertTrue(any("Дублирование" in e for e in errors), errors)
 
     def test_duplicate_name_across_block_instances_is_allowed(self):
@@ -137,15 +137,14 @@ class TestParsing(unittest.TestCase):
             repeat: 3
             step: 0x10
             registers:
-              - offset: 0x00
-                name: X
+              - name: X
                 type: uint16
                 getter: get_x
         """
         with tempfile.TemporaryDirectory() as tmp:
             result = parse_ok(tmp, "reg.yaml", text)
             self.assertEqual(result.errors, [])
-            self.assertEqual(validate_model(result.registers), [])
+            self.assertEqual(validate_model(result.registers, result.blocks), [])
 
     def test_overlap_between_adjacent_registers_detected(self):
         text = """
@@ -160,7 +159,7 @@ class TestParsing(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result = parse_ok(tmp, "reg.yaml", text)
             self.assertEqual(result.errors, [])
-            errors = validate_model(result.registers)
+            errors = validate_model(result.registers, result.blocks)
             self.assertTrue(any("Пересечение" in e for e in errors), errors)
 
     def test_overlap_hidden_behind_a_gap_is_still_detected(self):
@@ -183,11 +182,11 @@ class TestParsing(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result = parse_ok(tmp, "reg.yaml", text)
             self.assertEqual(result.errors, [])
-            errors = validate_model(result.registers)
+            errors = validate_model(result.registers, result.blocks)
             self.assertTrue(any("Пересечение" in e for e in errors), errors)
 
-    def test_offset_plus_occupied_exceeds_step(self):
-        # float занимает 2 регистра, offset=0x00, step=0x01 -> 0+2 > 1, нарушение.
+    def test_occupied_exceeds_step(self):
+        # float занимает 2 регистра, step=1 — поле не помещается.
         text = """
         blocks:
           - name: CH
@@ -195,16 +194,15 @@ class TestParsing(unittest.TestCase):
             repeat: 2
             step: 0x01
             registers:
-              - offset: 0x00
-                type: float
+              - type: float
                 getter: get_x
         """
         with tempfile.TemporaryDirectory() as tmp:
             result = parse_ok(tmp, "reg.yaml", text)
             self.assertTrue(any("границу шага" in e for e in result.errors), result.errors)
 
-    def test_offset_plus_occupied_exactly_fitting_step_is_valid(self):
-        # float занимает 2 регистра, offset=0x00, step=0x02 -> занимает [0,1],
+    def test_occupied_exactly_fitting_step_is_valid(self):
+        # float занимает 2 регистра при step=2 — занимает [0,1],
         # следующий экземпляр начинается с 2 - ровно по границе, это НЕ нарушение.
         text = """
         blocks:
@@ -213,16 +211,15 @@ class TestParsing(unittest.TestCase):
             repeat: 2
             step: 0x02
             registers:
-              - offset: 0x00
-                type: float
+              - type: float
                 getter: get_x
         """
         with tempfile.TemporaryDirectory() as tmp:
             result = parse_ok(tmp, "reg.yaml", text)
             self.assertEqual(result.errors, [])
 
-    def test_offset_plus_occupied_with_nested_count_exceeds_step(self):
-        # float[count=2] занимает 4 регистра, offset=0x00, step=0x03 -> 0+4 > 3, нарушение.
+    def test_occupied_with_nested_count_exceeds_step(self):
+        # float[count=2] занимает 4 регистра при step=3 — массив не помещается.
         text = """
         blocks:
           - name: CH
@@ -230,8 +227,7 @@ class TestParsing(unittest.TestCase):
             repeat: 1
             step: 0x03
             registers:
-              - offset: 0x00
-                type: float
+              - type: float
                 count: 2
                 getter: get_x
         """
@@ -258,8 +254,7 @@ class TestParsing(unittest.TestCase):
             repeat: 100
             step: 0x10
             registers:
-              - offset: 0x00
-                type: uint16
+              - type: uint16
                 getter: get_x
         """
         with tempfile.TemporaryDirectory() as tmp:
@@ -287,6 +282,117 @@ class TestParsing(unittest.TestCase):
                 self.assertEqual(r.access_mode, "RESERVED")
 
 
+class TestSequentialBlocks(unittest.TestCase):
+    def parse_model(self, block, registers=None):
+        data = {'blocks': [block]}
+        if registers is not None:
+            data['registers'] = registers
+        with tempfile.TemporaryDirectory() as tmp:
+            return parse_ok(tmp, 'reg.yaml', yaml.safe_dump(data))
+
+    def block(self, **changes):
+        block = {
+            'name': 'CH', 'start_addr': 0x100, 'repeat': 2,
+            'registers': [{'name': 'VALUE', 'type': 'uint16', 'getter': 'get_value'}],
+        }
+        block.update(changes)
+        return block
+
+    def test_offsets_include_arrays_and_reserved_fields(self):
+        result = self.parse_model(self.block(registers=[
+            {'name': 'FIRST', 'type': 'uint8', 'getter': 'get_first'},
+            {'name': 'RESERVED_1', 'type': 'uint16', 'count': 3},
+            {'name': 'VALUES', 'type': 'float', 'count': 2, 'getter': 'get_values'},
+            {'type': 'uint32'},
+            {'name': 'LAST', 'type': 'bool', 'getter': 'get_last'},
+        ]))
+        self.assertEqual(result.errors, [])
+        self.assertEqual(validate_model(result.registers, result.blocks), [])
+        block = result.blocks[0]
+        self.assertEqual([r.offset for r in block.registers], [0, 1, 4, 8, 10])
+        self.assertEqual(block.step, 11)
+        self.assertEqual(block.end_addr, 0x115)
+        values = [r for r in result.registers if r.reg_name == 'VALUES']
+        self.assertEqual([r.addr for r in values], [0x104, 0x106, 0x10F, 0x111])
+        self.assertEqual([r.call_index_args for r in values], [[0, 0], [0, 1], [1, 0], [1, 1]])
+
+    def test_explicit_step_keeps_tail_and_instance_addresses(self):
+        result = self.parse_model(self.block(step=16))
+        self.assertEqual(result.errors, [])
+        self.assertEqual([r.addr for r in result.registers], [0x100, 0x110])
+        self.assertEqual(result.blocks[0].end_addr, 0x11F)
+
+    def test_offset_is_rejected_even_when_zero_or_null(self):
+        for offset in (0, 4, None):
+            with self.subTest(offset=offset):
+                result = self.parse_model(self.block(registers=[{'offset': offset, 'type': 'uint16'}]))
+                self.assertEqual(len(result.errors), 1)
+                self.assertIn('offset удалён из формата', result.errors[0])
+                self.assertIn('RESERVED', result.errors[0])
+
+    def test_invalid_step_is_rejected(self):
+        for step in (0, -1, True, '16', 1.5, None):
+            with self.subTest(step=step):
+                result = self.parse_model(self.block(step=step))
+                self.assertTrue(any('step' in e for e in result.errors), result.errors)
+
+    def test_tail_overflow_is_rejected(self):
+        result = self.parse_model(self.block(start_addr=0xFFFF, repeat=1, step=2))
+        self.assertTrue(any('хвоста' in e and '0xFFFF' in e for e in result.errors), result.errors)
+
+    def test_region_can_end_exactly_at_ffff(self):
+        result = self.parse_model(self.block(start_addr=0xFFF0, repeat=1, step=16))
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.blocks[0].end_addr, 0xFFFF)
+
+    def test_register_cannot_occupy_tail_of_any_instance(self):
+        for addr in (0x101, 0x10F, 0x111, 0x11F):
+            with self.subTest(addr=addr):
+                result = self.parse_model(self.block(step=16), [{'addr': addr, 'type': 'uint16'}])
+                self.assertEqual(result.errors, [])
+                self.assertTrue(any('Пересечение' in e for e in validate_model(result.registers, result.blocks)))
+
+    def test_register_just_after_block_is_allowed(self):
+        result = self.parse_model(self.block(step=16), [{'addr': 0x120, 'type': 'uint16'}])
+        self.assertEqual(result.errors, [])
+        self.assertEqual(validate_model(result.registers, result.blocks), [])
+
+    def test_block_cannot_occupy_another_blocks_tail(self):
+        for start in (0x101, 0x11F):
+            with self.subTest(start=start), tempfile.TemporaryDirectory() as tmp:
+                result = parse_ok(tmp, 'reg.yaml', yaml.safe_dump({'blocks': [
+                    self.block(step=16), self.block(name='OTHER', start_addr=start, repeat=1),
+                ]}))
+                self.assertEqual(result.errors, [])
+                self.assertTrue(any('Пересечение' in e for e in validate_model(result.registers, result.blocks)))
+
+    def test_reserved_fields_still_require_unique_names(self):
+        result = self.parse_model(self.block(registers=[
+            {'name': 'RESERVED_1', 'type': 'uint16'},
+            {'name': 'RESERVED_1', 'type': 'uint16'},
+        ]))
+        self.assertEqual(result.errors, [])
+        self.assertTrue(any('Дублирование' in e for e in validate_model(result.registers, result.blocks)))
+
+    def test_top_level_reserved_names_are_also_checked(self):
+        result = self.parse_model(self.block(), [
+            {'addr': 1, 'name': 'RESERVED_1', 'type': 'uint16'},
+            {'addr': 2, 'name': 'RESERVED_1', 'type': 'uint16'},
+        ])
+        self.assertEqual(result.errors, [])
+        self.assertTrue(any('Дублирование' in e for e in validate_model(result.registers, result.blocks)))
+
+    def test_unnamed_reserved_fields_are_allowed(self):
+        result = self.parse_model(self.block(registers=[{'type': 'uint16'}, {'type': 'uint32'}]))
+        self.assertEqual(result.errors, [])
+        self.assertEqual(validate_model(result.registers, result.blocks), [])
+        self.assertEqual(result.blocks[0].step, 3)
+
+    def test_reserved_type_is_required(self):
+        result = self.parse_model(self.block(registers=[{'name': 'RESERVED_1', 'count': 2}]))
+        self.assertTrue(any("обязательное поле 'type'" in e for e in result.errors), result.errors)
+
+
 class TestCodegen(unittest.TestCase):
     def test_header_is_static_and_minimal(self):
         h = generate_header()
@@ -294,12 +400,12 @@ class TestCodegen(unittest.TestCase):
         self.assertIn("void ModbusRegModelInit(void);", h)
         self.assertNotIn("#define REG_", h)  # адреса не должны утекать в .h
 
-    def test_reserved_register_has_define_but_no_case(self):
+    def test_reserved_register_has_no_define_or_case(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = parse_ok(tmp, "reg.yaml", BASIC_YAML)
             regs = sorted(result.registers, key=lambda r: r.addr)
             src = generate_source(regs, result.includes)
-            self.assertIn("#define REG_RESERVED_EXPANSION_0", src)
+            self.assertNotIn("#define REG_RESERVED_EXPANSION_0", src)
             self.assertNotIn("case REG_RESERVED_EXPANSION_0:", src)
 
     def test_bool_uses_reg16_both_directions(self):

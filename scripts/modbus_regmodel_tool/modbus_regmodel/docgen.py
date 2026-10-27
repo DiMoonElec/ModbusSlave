@@ -140,14 +140,43 @@ def _render_blocks(blocks: list[LogicalBlock]) -> list[str]:
     return lines
 
 
+def _render_planar_blocks(blocks: list[LogicalBlock]) -> list[str]:
+    lines: list[str] = []
+    for block in sorted(blocks, key=lambda b: b.start_addr):
+        lines.append(f"### Planar-блок `{block.name}`\n")
+        lines.append(f"- Начальный адрес: {_addr_dec_hex(block.start_addr)}")
+        lines.append(f"- Количество экземпляров: {block.repeat}")
+        lines.append(f"- Вместимость каждой колонки (capacity): {block.capacity} экземпляров")
+        lines.append(f"- Область блока: {_addr_range_dec_hex(block.start_addr, block.end_addr)}\n")
+        lines.append("| Колонка | Имя | Тип | Доступ | Адреса элементов | Полное окно | Описание | Ед. изм. |")
+        lines.append("| :---: | --- | --- | :---: | --- | --- | --- | :---: |")
+        for k, reg in enumerate(block.registers):
+            start = block.start_addr + reg.offset
+            end = start + block.repeat * reg.regs_per_element - 1
+            window_end = start + block.capacity * reg.regs_per_element - 1
+            row = [str(k), reg.name or '_(без имени)_', reg.canonical_type, reg.access_mode,
+                   _addr_range_dec_hex(start, end), _addr_range_dec_hex(start, window_end),
+                   _val_or_dash(reg.description), _val_or_dash(reg.unit)]
+            lines.append('| ' + ' | '.join(_md_escape(c) for c in row) + ' |')
+        lines.append("")
+        lines.append("Адрес: `start_addr + column_offset + instance * size(type)`, где `column_offset = capacity * sum(size(type) предыдущих полей)`, `instance` — номер экземпляра от 0. Размеры типов указаны в Modbus-регистрах.\n")
+        inst = 1 if block.repeat > 1 else 0
+        size = block.registers[0].regs_per_element
+        addr = block.start_addr + inst * size
+        lines.append(f"Пример для первого поля, экземпляр {inst}: `{block.start_addr} + 0 + {inst} * {size} = {addr}` (0x{addr:04X}).\n")
+        lines.append("Адреса элементов показывают используемые экземпляры. Полное окно занимает `capacity * size(type)` регистров; оставшиеся `capacity - repeat` элементов — резерв. Для поля без getter/setter зарезервирована вся колонка. При чтении резервов возвращается ноль, запись игнорируется.\n")
+    return lines
+
+
 def _render_flat_table(registers: list[FlatRegister]) -> list[str]:
     lines: list[str] = []
     lines.append("## 4. Плоская модель (полная карта адресов)\n")
     lines.append(
-        "Полный список фактически занятых Modbus-адресов после развёртки всех "
-        "`count` и `blocks` в отдельные регистры, с точными именами, которые "
-        "использует сгенерированный C-код (`#define`). Адреса, не попавшие в "
-        "этот список, не заняты ни одним регистром. Для значений, занимающих "
+        "Список явно описанных значений после развёртки `count`, `blocks` и "
+        "`planar_blocks` в отдельные записи. Для полей с обработчиками имена "
+        "совпадают с именами в сгенерированном C-коде (`#define`). Неявные "
+        "резервные области в таблице не перечислены, но входят в области "
+        "блоков, заданные их параметрами. Для значений, занимающих "
         "2 регистра (`uint32_t`/`int32_t`/`float`), в столбцах адреса указан "
         "диапазон обоих регистров - обращаться к ним нужно одним запросом "
         "(см. раздел 1).\n"
@@ -169,6 +198,10 @@ def _render_flat_table(registers: list[FlatRegister]) -> list[str]:
         )
 
     lines.append("")
+    if any(reg.access_mode == 'RESERVED' for reg in registers):
+        lines.append("Имена строк `RESERVED` обозначают записи модели; для них `#define` и обработчики не генерируются.\n")
+    if any(reg.is_planar for reg in registers):
+        lines.append("Поля `planar_blocks` также развёрнуты в эту таблицу. Хвосты колонок не перечислены, но входят в занятую область соответствующего блока.\n")
     return lines
 
 
@@ -176,13 +209,14 @@ def generate_markdown(result: ParseResult) -> str:
     """Собирает полный markdown-документ по уже провалидированной модели.
 
     Вызывающая сторона должна убедиться, что result.errors пуст и
-    validate.validate_model(result.registers) не вернула ошибок - документ
+    validate.validate_model(result.registers, result.blocks) не вернула ошибок - документ
     генерируется на тех же данных, что и C-код, и рассчитан на то, что модель
     непротиворечива."""
     parts: list[str] = []
     parts.append("# Регистровая карта устройства (Modbus)\n")
     parts.append(INTRO)
     parts.extend(_render_top_registers(result.top_registers))
-    parts.extend(_render_blocks(result.blocks))
+    parts.extend(_render_blocks([b for b in result.blocks if not b.is_planar]))
+    parts.extend(_render_planar_blocks([b for b in result.blocks if b.is_planar]))
     parts.extend(_render_flat_table(result.registers))
     return "\n".join(parts).rstrip() + "\n"

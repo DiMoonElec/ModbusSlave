@@ -174,7 +174,7 @@ def generate_source(registers: list[FlatRegister], includes: list[str]) -> str:
             lines.append(f'#include "{inc}"')
         lines.append("")
 
-    named = [r for r in registers if r.c_name is not None]
+    named = [r for r in registers if r.c_name is not None and (r.getter or r.setter)]
     if named:
         lines.append("/* === Symbolic addresses === */")
         width = max(len(r.c_name) for r in named)
