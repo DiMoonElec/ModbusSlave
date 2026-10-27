@@ -509,7 +509,10 @@ void modbus_slave_set_read_holding_reg_callback(modbus_slave_read_holding_reg_ca
 #if !defined(MODBUS_SLAVE_CFG_REGMODEL_SIMPLE)
 
 
-bool modbus_slave_write_holding_reg32(modbus_slave_context_t *context, void *value)
+static bool modbus_slave_write_holding_reg32_order(modbus_slave_context_t *context,
+                                                   void *value,
+                                                   uint8_t i0, uint8_t i1,
+                                                   uint8_t i2, uint8_t i3)
 {
   if(context->state != MODBUS_STATE_BEGIN)
   {
@@ -526,20 +529,45 @@ bool modbus_slave_write_holding_reg32(modbus_slave_context_t *context, void *val
     return false;
   }
 
-  // Пример, порядок слов по соглашению
+  const uint8_t *in = context->buffer;
+  uint8_t bytes[4];
   uint32_t tmp;
-  uint8_t *in = context->buffer;
-  
-  tmp = (uint32_t)(*in++) << 24;
-  tmp |= (uint32_t)(*in++) << 16;
-  tmp |= (uint32_t)(*in++) << 8;
-  tmp |= (uint32_t)(*in);
-  
+
+  bytes[0] = in[i0];
+  bytes[1] = in[i1];
+  bytes[2] = in[i2];
+  bytes[3] = in[i3];
+
+  tmp = (uint32_t)bytes[0] << 24;
+  tmp |= (uint32_t)bytes[1] << 16;
+  tmp |= (uint32_t)bytes[2] << 8;
+  tmp |= (uint32_t)bytes[3];
+
   memcpy(value, &tmp, sizeof(tmp));
-  
+
   context->consumed = 2; // Съели 2 регистра
   context->state = MODBUS_STATE_PROCESSED; // Обработка прошла успешно
   return true;
+}
+
+bool modbus_slave_write_holding_reg32_abcd(modbus_slave_context_t *context, void *value)
+{
+  return modbus_slave_write_holding_reg32_order(context, value, 0, 1, 2, 3);
+}
+
+bool modbus_slave_write_holding_reg32_badc(modbus_slave_context_t *context, void *value)
+{
+  return modbus_slave_write_holding_reg32_order(context, value, 1, 0, 3, 2);
+}
+
+bool modbus_slave_write_holding_reg32_cdab(modbus_slave_context_t *context, void *value)
+{
+  return modbus_slave_write_holding_reg32_order(context, value, 2, 3, 0, 1);
+}
+
+bool modbus_slave_write_holding_reg32_dcba(modbus_slave_context_t *context, void *value)
+{
+  return modbus_slave_write_holding_reg32_order(context, value, 3, 2, 1, 0);
 }
 
 bool modbus_slave_write_holding_reg16(modbus_slave_context_t *context, void *value)
@@ -590,7 +618,10 @@ bool modbus_slave_write_holding_reg8(modbus_slave_context_t *context, void *valu
   return true;
 }
 
-void modbus_slave_read_holding_reg32(modbus_slave_context_t *context, void *value)
+static void modbus_slave_read_holding_reg32_order(modbus_slave_context_t *context,
+                                                  void *value,
+                                                  uint8_t i0, uint8_t i1,
+                                                  uint8_t i2, uint8_t i3)
 {
   if(context->state != MODBUS_STATE_BEGIN)
   {
@@ -609,17 +640,43 @@ void modbus_slave_read_holding_reg32(modbus_slave_context_t *context, void *valu
   }
 
   uint32_t tmp;
+  uint8_t bytes[4];
   uint8_t *out = context->buffer;
 
   memcpy(&tmp, value, sizeof(tmp));
 
-  (*out++) = (uint8_t)(tmp >> 24);
-  (*out++) = (uint8_t)(tmp >> 16);
-  (*out++) = (uint8_t)(tmp >> 8);
-  (*out) =  (uint8_t)(tmp);
+  bytes[0] = (uint8_t)(tmp >> 24);
+  bytes[1] = (uint8_t)(tmp >> 16);
+  bytes[2] = (uint8_t)(tmp >> 8);
+  bytes[3] = (uint8_t)(tmp);
+
+  out[0] = bytes[i0];
+  out[1] = bytes[i1];
+  out[2] = bytes[i2];
+  out[3] = bytes[i3];
 
   context->consumed = 2; // Съели 2 регистра
   context->state = MODBUS_STATE_PROCESSED; // Обработка прошла успешно
+}
+
+void modbus_slave_read_holding_reg32_abcd(modbus_slave_context_t *context, void *value)
+{
+  modbus_slave_read_holding_reg32_order(context, value, 0, 1, 2, 3);
+}
+
+void modbus_slave_read_holding_reg32_badc(modbus_slave_context_t *context, void *value)
+{
+  modbus_slave_read_holding_reg32_order(context, value, 1, 0, 3, 2);
+}
+
+void modbus_slave_read_holding_reg32_cdab(modbus_slave_context_t *context, void *value)
+{
+  modbus_slave_read_holding_reg32_order(context, value, 2, 3, 0, 1);
+}
+
+void modbus_slave_read_holding_reg32_dcba(modbus_slave_context_t *context, void *value)
+{
+  modbus_slave_read_holding_reg32_order(context, value, 3, 2, 1, 0);
 }
 
 void modbus_slave_read_holding_reg16(modbus_slave_context_t *context, void *value)
